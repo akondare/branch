@@ -46,12 +46,6 @@ unsigned int gMask;
 unsigned int lMask;
 unsigned int pcMask;
 
-int bias;
-int ** weights;
-int num_perceptrons;
-int num_branches;
-int thres;
-
 //------------------------------------//
 //        Predictor Functions         //
 //------------------------------------//
@@ -102,19 +96,33 @@ void init_tournament() {
 
 void init_custom() {
   ghistoryBits = 15;
-  pcIndexBits = 10;
-  thres = 5;
-  ghr = 0;
-  bias = 0;
-  num_perceptrons = (1<<ghistoryBits);
-  num_branches = (1<<pcIndexBits);
-  weights = (int **)calloc(num_branches, sizeof(int *));
-  pcMask = ~( (-1) << pcIndexBits );
-  for( int i = 0; i < num_branches; i++ ) {
-    weights[i] = (int *)calloc(num_perceptrons, sizeof(int));
-  }
-}
+  lhistoryBits = 15;
+  pcIndexBits = 15;
+  int gNum = 1<<ghistoryBits;
+  int lNum = 1<<lhistoryBits;
+  int pcNum = 1<<pcIndexBits;
 
+  ghr = 0;
+
+  lhr = (int *)calloc(pcNum, sizeof(int));
+  pht = (int *)calloc(lNum, sizeof(int));
+  ght = (int *)calloc(gNum, sizeof(int));
+  cht = (int *)calloc(gNum, sizeof(int));
+
+  // initialize predictions to weakly not taken (01 - two bit)
+  for( int i = 0; i < gNum; i++ ) {
+    ght[i] = WN;
+    cht[i] = WT;
+  }
+
+  for( int i = 0; i < lNum; i++ ) {
+    pht[i] = WN;
+  }
+
+  gMask = ~( (-1) << ghistoryBits );
+  pcMask = ~( (-1) << pcIndexBits );
+  lMask = ~( (-1) << lhistoryBits );
+}
 
 // Initialize the predictor
 //
@@ -137,25 +145,10 @@ void init_predictor()
 
 void free_predictor()
 {
-  switch (bpType) {
-    case GSHARE:
-      free(ght);
-      break;
-    case TOURNAMENT:
-      free(ght);
-      free(lhr);
-      free(pht);
-      free(cht);
-      break;
-    case CUSTOM:
-      for( int i = 0; i < num_branches; i++ ) {
-        free(weights[i]);
-      }
-      free(weights);
-      break;
-    default:
-      break;
-  }
+  free(ght);
+  free(lhr);
+  free(pht);
+  free(cht);
 }
 
 uint8_t local_pred(uint32_t pc) {
@@ -170,13 +163,7 @@ uint8_t gshare_pred(uint32_t pc) {
 }
 
 uint8_t custom_pred(uint32_t pc) {
-  int * w = weights[pc & pcMask];
-  int g = ghr;
-  int result = bias;
-  for( int i = 0; i < num_perceptrons; i++ ) {
-    result += ((((g >> i) & 1)==1) ? 1 : -1) * w[i];
-  }
-  return result;
+  return NOTTAKEN;
 }
 // Make a prediction for conditional branch instruction at PC 'pc'
 // Returning TAKEN indicates a prediction of taken; returning NOTTAKEN
@@ -192,7 +179,7 @@ uint8_t make_prediction(uint32_t pc)
     case TOURNAMENT:
       return  (cht[(ghr)&gMask]>>1 == 0) ? local_pred(pc):global_pred(pc);
     case CUSTOM:
-      return (custom_pred(pc) >= 0) ? TAKEN : NOTTAKEN;
+      return  (cht[(ghr^pc)&gMask]>>1 == 0) ? local_pred(pc):gshare_pred(pc);
     default:
       break;
   }
@@ -205,28 +192,6 @@ uint8_t make_prediction(uint32_t pc)
 // outcome 'outcome' (true indicates that the branch was taken, false
 // indicates that the branch was not taken)
 //
-void train_custom(uint32_t pc, uint8_t outcome) {
-  int t = (outcome == TAKEN) ? 1 : -1;
-
-  // get yout, absolute value of yout, and prediction
-  int yout = custom_pred(pc);
-  int pred = (yout >= 0) ? 1 : 0;
-  int abs = (yout >= 0) ? yout : -1*yout;
-  int p_Index = pc & pcMask;
-  fprintf(stderr, "Pred : %d, Outcome : %d, t : %d\n", yout, outcome, t);
-
-  // update if outcome != prediction or less then threshold
-  if( outcome != pred || abs <= thres ) {
-    bias = bias + t;
-    for( int i = 0; i < num_perceptrons; i++ ) {
-      weights[p_Index][i] += ((((ghr>>i)&1) == 1) ? 1 : -1)*t;
-    }
-  }
-
-  // update ghr
-  ghr = ( (ghr << 1) + outcome ) & gMask;
-}
-
 void train_gshare(uint32_t pc, uint8_t outcome) {
 
   int * address = &ght[ (ghr^pc) & gMask ];
@@ -309,6 +274,27 @@ void train_tournament(uint32_t pc, uint8_t outcome) {
   train_global(pc,outcome);
 }
 
+void train_custom(uint32_t pc, uint8_t outcome) {
+  int pred_local, pred_global, choice;
+
+  // get predictions and choice
+  pred_local = local_pred(pc);
+  pred_global = gshare_pred(pc);
+  choice = cht[(ghr^pc)&gMask];
+
+  // update choice based on predictions
+  if( pred_local == outcome && pred_global != outcome && choice > SN) {
+    cht[(ghr^pc)&gMask] -= 1;
+  }
+  if( pred_global == outcome && pred_local != outcome && choice < ST) {
+    cht[(ghr^pc)&gMask] += 1;
+  }
+
+  // train local and global predictors
+  train_local(pc,outcome);
+  train_gshare(pc,outcome);
+}
+
 void train_predictor(uint32_t pc, uint8_t outcome) {
 
   switch (bpType) {
@@ -319,8 +305,10 @@ void train_predictor(uint32_t pc, uint8_t outcome) {
       break;
     case TOURNAMENT:
       train_tournament(pc,outcome);
+      break;
     case CUSTOM:
       train_custom(pc,outcome);
+      break;
     default:
       break;
   }
